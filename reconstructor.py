@@ -3,62 +3,71 @@ from ebooklib import epub
 import fitz  # PyMuPDF
 import os
 
+from bs4 import BeautifulSoup
+
 def reconstruct_epub(translated_segments, book_data, original_file_name, output_format="Replace Original Text"):
     """
-    Reconstructs the EPUB file from the (potentially edited) translated segments,
-    applying the specified output format.
+    Reconstructs the EPUB file using block-level replacements based on unique IDs.
     """
     book = book_data['book']
     soups = book_data['soups']
     items = book_data['items']
 
-    # To prevent processing the same parent multiple times in side-by-side mode
-    processed_parents = set()
-
     for segment in translated_segments:
-        node = segment['metadata']['node']
-        soup = segment['metadata']['soup']
-        original_text = segment['original_text']
-        translated_text = segment['translated_text']
+        metadata = segment['metadata']
+        item_name = metadata['item_name']
+        block_id = metadata['block_id']
+        original_html = segment['original_text']
+        translated_html = segment['translated_text']
+
+        soup = soups.get(item_name)
+        if not soup:
+            continue
+
+        element_to_modify = soup.find(attrs={'data-translatorx-id': block_id})
+        if not element_to_modify:
+            continue
+
+        # Clean up the ID after finding the element
+        del element_to_modify['data-translatorx-id']
 
         if output_format == "Translation Below Original":
-            # Create a new <p> tag for the translation, style it, and insert it
-            # after the parent of the original text node.
-            new_p = soup.new_tag("p")
-            new_p.string = translated_text
-            new_p.attrs['style'] = "font-style: italic; color: #555; margin-top: 5px; margin-bottom: 5px;"
-            if node.parent and node.parent.name != 'body':
-                 node.parent.insert_after(new_p)
-            else: # Fallback for nodes directly under body
-                 node.insert_after(new_p)
+            # The original element is kept as is. A new element with the translation is inserted after it.
+            new_tag = soup.new_tag("div")
+            new_tag.attrs['style'] = "font-style: italic; color: #555; margin-top: 5px; margin-bottom: 5px; border-top: 1px solid #ccc; padding-top: 5px;"
+            # The translated_html is parsed and appended to the new tag
+            new_tag.append(BeautifulSoup(translated_html, 'html.parser'))
+            element_to_modify.insert_after(new_tag)
 
         elif output_format == "Side-by-Side (Two Columns)":
-            # Replace the text node with a 2-column table
+            # The original element is replaced by a table containing both original and translated content.
             table = soup.new_tag("table")
             table.attrs['style'] = "width: 100%; border-collapse: collapse; margin-top: 10px; margin-bottom: 10px; border: 1px solid #ddd;"
             tr = soup.new_tag("tr")
 
             td_orig = soup.new_tag("td", attrs={'style': "width: 50%; padding: 8px; vertical-align: top; border: 1px solid #ddd;"})
-            td_orig.string = original_text
+            td_orig.append(BeautifulSoup(original_html, 'html.parser'))
 
             td_trans = soup.new_tag("td", attrs={'style': "width: 50%; padding: 8px; vertical-align: top; border: 1px solid #ddd;"})
-            td_trans.string = translated_text
+            td_trans.append(BeautifulSoup(translated_html, 'html.parser'))
 
             tr.append(td_orig)
             tr.append(td_trans)
             table.append(tr)
-
-            node.replace_with(table)
+            element_to_modify.replace_with(table)
 
         else:  # Default: "Replace Original Text"
-            node.replace_with(translated_text)
+            # Clear the original content and insert the translated HTML
+            element_to_modify.clear()
+            element_to_modify.append(BeautifulSoup(translated_html, 'html.parser'))
 
     # Write the modified soup content back to the ebook items
     for item in items:
-        # Find the corresponding soup object
         soup = soups.get(item.get_name())
         if soup:
-            item.set_content(soup.prettify(encoding='utf-8'))
+            # Use decode_contents to avoid adding extra <html><body> tags, but rather just the content
+            item.set_content(soup.encode_contents(formatter="html5"))
+
 
     # Define an output directory to avoid clutter
     output_dir = "temp_output"

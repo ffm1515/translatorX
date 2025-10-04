@@ -5,6 +5,7 @@ from parser import parse_epub, parse_pdf
 from translator import BaseTranslator, GeminiTranslator, DeepLTranslator, process_epub_content, process_pdf_content
 from reconstructor import reconstruct_epub, reconstruct_pdf
 import shutil
+import subprocess
 
 # --- App Configuration ---
 st.set_page_config(
@@ -12,6 +13,11 @@ st.set_page_config(
     page_icon="📚",
     layout="centered",
 )
+
+# --- Calibre Check ---
+def check_calibre():
+    """Checks if Calibre's ebook-convert tool is available in the system's PATH."""
+    return shutil.which('ebook-convert') is not None
 
 # --- Translator Factory ---
 def get_translator(engine: str, api_key: str) -> BaseTranslator:
@@ -51,6 +57,9 @@ def main():
     st.title("📚 translatorX")
     st.markdown("Translate EPUB and PDF files while preserving the original layout and formatting.")
 
+    if not check_calibre():
+        st.info("For formats other than EPUB and PDF, Calibre must be installed and 'ebook-convert' must be added to the system's PATH.")
+
     with st.sidebar:
         st.header("⚙️ 1. Configure Settings")
         engine_choice = st.selectbox(
@@ -76,6 +85,13 @@ def main():
         output_format = st.selectbox("Output Format", output_options, help=help_text)
         st.session_state.output_format = output_format
 
+        if not is_pdf:
+            st.text_area(
+                "Inhalte via CSS-Selektor ignorieren",
+                help="Geben Sie einen Selektor pro Zeile ein (z.B. pre, code, .no-translate).",
+                key="css_selectors_to_ignore"
+            )
+
         st.header("📖 3. Add a Glossary (Optional)")
         glossary_file = st.file_uploader("Upload Glossary (CSV)", type=["csv"], help="Upload a two-column CSV.")
 
@@ -86,12 +102,51 @@ def main():
             st.rerun()
 
     st.header("📤 3. Upload Your Book")
-    uploaded_file = st.file_uploader("Upload an EPUB or PDF file", type=["epub", "pdf"], disabled=st.session_state.processing)
+    allowed_types = ["epub", "pdf", "azw3", "mobi"]
+    uploaded_file = st.file_uploader("Upload a book file", type=allowed_types, disabled=st.session_state.processing)
 
     if uploaded_file is not None:
-        st.session_state.uploaded_file_name = uploaded_file.name
+        st.session_state.original_file_name = uploaded_file.name
         st.session_state.uploaded_file_buffer = uploaded_file.getbuffer()
-        st.info(f"✅ File '{uploaded_file.name}' is ready.")
+        original_extension = os.path.splitext(uploaded_file.name)[1].lower()
+        st.session_state.original_extension = original_extension
+
+        if original_extension not in [".epub", ".pdf"]:
+            if not check_calibre():
+                st.error("Cannot process this file. Calibre's 'ebook-convert' is required but not found.")
+                st.stop()
+
+            with st.spinner(f"Converting {uploaded_file.name} to EPUB..."):
+                temp_dir = st.session_state.temp_dir
+                os.makedirs(temp_dir, exist_ok=True)
+
+                original_file_path = os.path.join(temp_dir, uploaded_file.name)
+                converted_epub_path = os.path.join(temp_dir, f"{os.path.splitext(uploaded_file.name)[0]}.epub")
+
+                with open(original_file_path, "wb") as f:
+                    f.write(st.session_state.uploaded_file_buffer)
+
+                try:
+                    subprocess.run(
+                        ['ebook-convert', original_file_path, converted_epub_path],
+                        check=True, capture_output=True, text=True
+                    )
+                    st.session_state.uploaded_file_name = os.path.basename(converted_epub_path)
+                    with open(converted_epub_path, "rb") as f:
+                        st.session_state.uploaded_file_buffer = f.read()
+
+                    st.info(f"✅ Converted '{uploaded_file.name}' to EPUB. File is ready.")
+
+                except subprocess.CalledProcessError as e:
+                    st.error(f"Failed to convert file with Calibre's ebook-convert: {e.stderr}")
+                    st.stop()
+                except FileNotFoundError:
+                    st.error("Calibre's 'ebook-convert' is required but not found in your system's PATH.")
+                    st.stop()
+        else:
+            st.session_state.uploaded_file_name = uploaded_file.name
+            st.info(f"✅ File '{uploaded_file.name}' is ready.")
+
 
     st.header("🚀 4. Translate")
     translate_button_disabled = not api_key or 'uploaded_file_buffer' not in st.session_state or st.session_state.processing
@@ -121,7 +176,9 @@ def main():
                 if file_extension == ".epub":
                     st.session_state.file_type = "epub"
                     book = parse_epub(file_path)
-                    processed_data = process_epub_content(translator, book, target_language, glossary)
+                    selectors_str = st.session_state.get('css_selectors_to_ignore', '')
+                    css_selectors_to_ignore = [s.strip() for s in selectors_str.split('\n') if s.strip()]
+                    processed_data = process_epub_content(translator, book, target_language, glossary, css_selectors_to_ignore=css_selectors_to_ignore)
                     st.session_state.translated_segments = processed_data.get('segments', [])
                     st.session_state.book_data = {'book': processed_data.get('book'), 'soups': processed_data.get('soups'), 'items': processed_data.get('items')}
                 elif file_extension == ".pdf":
@@ -196,15 +253,40 @@ def main():
     if st.session_state.translation_complete:
         st.header("📥 6. Download Your Book")
         st.info("Your translated book is ready. Click the button below to download it.")
-        output_file_path = ""
         try:
+            reconstructed_path = ""
             with st.spinner("Finalizing your file..."):
                 if st.session_state.file_type == "epub":
-                    output_file_path = reconstruct_epub(translated_segments=st.session_state.translated_segments, book_data=st.session_state.book_data, original_file_name=st.session_state.uploaded_file_name, output_format=st.session_state.output_format)
+                    reconstructed_path = reconstruct_epub(translated_segments=st.session_state.translated_segments, book_data=st.session_state.book_data, original_file_name=st.session_state.original_file_name, output_format=st.session_state.output_format)
                 elif st.session_state.file_type == "pdf":
-                    output_file_path = reconstruct_pdf(translated_segments=st.session_state.translated_segments, original_file_path=st.session_state.temp_file_path, output_format=st.session_state.output_format)
-            with open(output_file_path, "rb") as file:
-                st.download_button(label="Download Translated Book", data=file, file_name=os.path.basename(output_file_path), mime=f"application/{'epub+zip' if st.session_state.file_type == 'epub' else 'pdf'}", on_click=cleanup_temp_files)
+                    reconstructed_path = reconstruct_pdf(translated_segments=st.session_state.translated_segments, original_file_path=st.session_state.temp_file_path, output_format=st.session_state.output_format)
+
+            final_output_path = reconstructed_path
+            final_file_name = os.path.basename(reconstructed_path)
+            mime_type = f"application/{'epub+zip' if st.session_state.file_type == 'epub' else 'pdf'}"
+
+            original_ext = st.session_state.get('original_extension')
+            if original_ext and original_ext not in [".epub", ".pdf"] and st.session_state.file_type == 'epub':
+                 with st.spinner(f"Converting translated EPUB back to {original_ext}..."):
+                    output_dir = os.path.dirname(reconstructed_path)
+                    final_file_name = f"{os.path.splitext(st.session_state.original_file_name)[0]}_translated{original_ext}"
+                    final_output_path = os.path.join(output_dir, final_file_name)
+                    try:
+                        subprocess.run(['ebook-convert', reconstructed_path, final_output_path], check=True, capture_output=True, text=True)
+                        mime_type = "application/octet-stream"
+                    except subprocess.CalledProcessError as e:
+                        st.warning(f"Could not convert back to {original_ext}. Offering EPUB instead. Error: {e.stderr}")
+                        final_output_path = reconstructed_path
+                        final_file_name = os.path.basename(reconstructed_path)
+                        mime_type = "application/epub+zip"
+                    except FileNotFoundError:
+                        st.warning(f"Could not convert back to {original_ext} because 'ebook-convert' was not found. Offering EPUB instead.")
+                        final_output_path = reconstructed_path
+                        final_file_name = os.path.basename(reconstructed_path)
+                        mime_type = "application/epub+zip"
+
+            with open(final_output_path, "rb") as file:
+                st.download_button(label="Download Translated Book", data=file, file_name=final_file_name, mime=mime_type, on_click=cleanup_temp_files)
             st.warning("After downloading, click 'Start Over' in the sidebar to translate another book.")
         except Exception as e:
             st.error(f"Failed to create the final file: {e}")
