@@ -53,14 +53,39 @@ def init_session_state():
     # Stores segments waiting for translation
     if 'segments_to_translate' not in st.session_state:
         st.session_state.segments_to_translate = []
+    # Store CSS selectors to ignore
+    if 'css_selectors_to_ignore' not in st.session_state:
+        st.session_state.css_selectors_to_ignore = []
+
 
 def cleanup_temp_files():
     """Removes the temporary directory and all its contents."""
-    temp_dir = st.session_state.temp_dir
-    if os.path.exists(temp_dir):
+    temp_dir = st.session_state.get('temp_dir')
+    if temp_dir and os.path.exists(temp_dir):
         shutil.rmtree(temp_dir)
     if os.path.exists("temp_output"):
         shutil.rmtree("temp_output")
+
+def cleanup_after_download():
+    """Cleans up temporary files and session state keys after a successful download."""
+    cleanup_temp_files()
+    keys_to_clear = [
+        'review_df', 'engine_choice', 'api_key', 'target_language',
+        'glossary', 'translated_segments', 'book_data', 'original_extension',
+        'temp_file_path', 'uploaded_file_name', 'uploaded_file_buffer',
+        'translation_complete', 'review_mode', 'is_translating', 'processing',
+        'segments_to_translate', 'total_segments', 'file_type', 'font_cache',
+        'translator', 'original_file_name', 'css_selectors_to_ignore'
+    ]
+    for key in keys_to_clear:
+        if key in st.session_state:
+            del st.session_state[key]
+    # Re-initialize for a fresh start, but keep the pid-based temp_dir
+    temp_dir = st.session_state.get('temp_dir')
+    st.session_state.clear()
+    if temp_dir:
+        st.session_state.temp_dir = temp_dir
+
 
 # --- Main Application UI ---
 def main():
@@ -71,7 +96,11 @@ def main():
     st.markdown("Translate EPUB and PDF files while preserving the original layout and formatting.")
 
     if not check_calibre():
-        st.info("For formats other than EPUB and PDF, Calibre must be installed and 'ebook-convert' must be added to the system's PATH.")
+        st.warning("""
+            **Calibre is not installed or not in your system's PATH.**
+            To translate formats other than EPUB and PDF (e.g., .mobi, .azw3),
+            please [install Calibre](https://calibre-ebook.com/download) and ensure `ebook-convert` is accessible.
+            """, icon="⚠️")
 
     with st.sidebar:
         st.header("⚙️ 1. Configure Settings")
@@ -86,7 +115,7 @@ def main():
 
         st.header("📖 2. Configure Output")
 
-        is_pdf = 'uploaded_file_name' in st.session_state and st.session_state.uploaded_file_name.lower().endswith('.pdf')
+        is_pdf = 'original_file_name' in st.session_state and st.session_state.original_file_name.lower().endswith('.pdf')
 
         if is_pdf:
             output_options = ["Replace Original Text", "Side-by-Side (Two Columns)"]
@@ -98,27 +127,31 @@ def main():
         output_format = st.selectbox("Output Format", output_options, help=help_text)
         st.session_state.output_format = output_format
 
+        st.header("🛡️ 3. Content Filtering (EPUB Only)")
         if not is_pdf:
-            st.text_area(
-                "Inhalte via CSS-Selektor ignorieren",
-                help="Geben Sie einen Selektor pro Zeile ein (z.B. pre, code, .no-translate).",
-                key="css_selectors_to_ignore"
+            ignore_selectors_str = st.text_area(
+                "Ignore content via CSS selectors",
+                placeholder="e.g., .no-translate\npre\n.chapter-title",
+                help="Enter one CSS selector per line. Any text within elements matching these selectors will not be translated. This is only applied to EPUB files."
             )
+            st.session_state.css_selectors_to_ignore = [s.strip() for s in ignore_selectors_str.split('\n') if s.strip()]
 
-        st.header("📖 3. Add a Glossary (Optional)")
+        st.header("📖 4. Add a Glossary (Optional)")
         glossary_file = st.file_uploader("Upload Glossary (CSV)", type=["csv"], help="Upload a two-column CSV.")
 
         st.header("🔄 Reset")
         if st.button("Start Over"):
-            cleanup_temp_files()
-            st.session_state.clear()
+            # A more thorough cleanup
+            cleanup_after_download()
             st.rerun()
 
-    st.header("📤 3. Upload Your Book")
+    st.header("📤 5. Upload Your Book")
     allowed_types = ["epub", "pdf", "azw3", "mobi"]
-    uploaded_file = st.file_uploader("Upload a book file", type=allowed_types, disabled=st.session_state.processing)
+    # Disable uploader if a file is already being processed/translated
+    uploader_disabled = st.session_state.processing or st.session_state.is_translating or st.session_state.review_mode or st.session_state.translation_complete
+    uploaded_file = st.file_uploader("Upload a book file", type=allowed_types, disabled=uploader_disabled)
 
-    if uploaded_file is not None:
+    if uploaded_file is not None and 'original_file_name' not in st.session_state:
         st.session_state.original_file_name = uploaded_file.name
         st.session_state.uploaded_file_buffer = uploaded_file.getbuffer()
         original_extension = os.path.splitext(uploaded_file.name)[1].lower()
@@ -144,24 +177,22 @@ def main():
                         ['ebook-convert', original_file_path, converted_epub_path],
                         check=True, capture_output=True, text=True
                     )
+                    # The file to be processed is now the converted EPUB
                     st.session_state.uploaded_file_name = os.path.basename(converted_epub_path)
                     with open(converted_epub_path, "rb") as f:
                         st.session_state.uploaded_file_buffer = f.read()
 
-                    st.info(f"✅ Converted '{uploaded_file.name}' to EPUB. File is ready.")
+                    st.info(f"✅ Converted '{uploaded_file.name}' to EPUB. Ready to translate.")
 
                 except subprocess.CalledProcessError as e:
                     st.error(f"Failed to convert file with Calibre's ebook-convert: {e.stderr}")
-                    st.stop()
-                except FileNotFoundError:
-                    st.error("Calibre's 'ebook-convert' is required but not found in your system's PATH.")
                     st.stop()
         else:
             st.session_state.uploaded_file_name = uploaded_file.name
             st.info(f"✅ File '{uploaded_file.name}' is ready.")
 
 
-    st.header("🚀 4. Translate")
+    st.header("🚀 6. Translate")
     # Disable button if processing, or if already translated, or if no file/API key
     translate_button_disabled = not api_key or 'uploaded_file_buffer' not in st.session_state or st.session_state.processing or st.session_state.is_translating or st.session_state.review_mode
 
@@ -193,10 +224,8 @@ def main():
             if file_extension == ".epub":
                 st.session_state.file_type = "epub"
                 book = parse_epub(file_path)
-                selectors_str = st.session_state.get('css_selectors_to_ignore', '')
-                css_selectors_to_ignore = [s.strip() for s in selectors_str.split('\n') if s.strip()]
                 # This function call now needs to be adapted to just prepare, not translate
-                st.session_state.segments_to_translate, st.session_state.book_data = process_epub_content(None, book, target_language, st.session_state.glossary, css_selectors_to_ignore, prepare_only=True)
+                st.session_state.segments_to_translate, st.session_state.book_data = process_epub_content(None, book, target_language, st.session_state.glossary, st.session_state.css_selectors_to_ignore, prepare_only=True)
 
             elif file_extension == ".pdf":
                 st.session_state.file_type = "pdf"
@@ -215,13 +244,6 @@ def main():
         st.rerun() # Rerun to start the iterative translation
 
     # --- 3. ITERATIVE TRANSLATION AND PROGRESS BAR ---
-    # This section implements a non-blocking, iterative translation process.
-    # Instead of using a background thread (e.g., with concurrent.futures), which can be
-    # complex to manage with Streamlit's execution model, we use st.rerun().
-    # The app translates a small CHUNK_SIZE of segments in each script run,
-    # updating the session state and progress bar, then triggers a rerun.
-    # This pattern is robust for long-running tasks in Streamlit, as it prevents
-    # the server from timing out and provides a responsive UI.
     if st.session_state.is_translating and 'total_segments' in st.session_state:
         total_segments = st.session_state.total_segments
         if total_segments == 0:
@@ -236,34 +258,34 @@ def main():
         CHUNK_SIZE = 5 # Process 5 segments per rerun
         segments_chunk = st.session_state.segments_to_translate[:CHUNK_SIZE]
 
-        # This part will be refactored to be more efficient later if needed
-        original_texts = [seg['original_text'] for seg in segments_chunk]
-        metadatas = [seg['metadata'] for seg in segments_chunk]
+        if segments_chunk:
+            original_texts = [seg['original_text'] for seg in segments_chunk]
+            metadatas = [seg['metadata'] for seg in segments_chunk]
 
-        delimiter = "[END_OF_TEXT_NODE]" if st.session_state.file_type == 'epub' else "[END_OF_SPAN]"
-        full_text_chunk = delimiter.join(original_texts)
+            delimiter = "[END_OF_TEXT_NODE]" if st.session_state.file_type == 'epub' else "[END_OF_SPAN]"
+            full_text_chunk = delimiter.join(original_texts)
 
-        translator = st.session_state.translator
-        translated_full_text = translator.translate(full_text_chunk, st.session_state.target_language, st.session_state.glossary)
-        translated_texts = translated_full_text.split(delimiter)
+            translator = st.session_state.translator
+            translated_full_text = translator.translate(full_text_chunk, st.session_state.target_language, st.session_state.glossary)
+            translated_texts = translated_full_text.split(delimiter)
 
-        # Handle cases where the translation API fails to preserve delimiters
-        if len(translated_texts) != len(original_texts):
-             # Fallback to individual translation for this chunk
-            translated_texts = [translator.translate(text, st.session_state.target_language, st.session_state.glossary) for text in original_texts]
+            # Handle cases where the translation API fails to preserve delimiters
+            if len(translated_texts) != len(original_texts):
+                 # Fallback to individual translation for this chunk
+                translated_texts = [translator.translate(text, st.session_state.target_language, st.session_state.glossary) for text in original_texts]
 
-        for i, original_text in enumerate(original_texts):
-            st.session_state.translated_segments.append({
-                'original_text': original_text,
-                'translated_text': translated_texts[i].strip(),
-                'metadata': metadatas[i]
-            })
+            for i, original_text in enumerate(original_texts):
+                st.session_state.translated_segments.append({
+                    'original_text': original_text,
+                    'translated_text': translated_texts[i].strip(),
+                    'metadata': metadatas[i]
+                })
 
-        # Update the list of segments remaining
-        st.session_state.segments_to_translate = st.session_state.segments_to_translate[CHUNK_SIZE:]
+            # Update the list of segments remaining
+            st.session_state.segments_to_translate = st.session_state.segments_to_translate[CHUNK_SIZE:]
 
         # Update progress
-        progress_value = len(st.session_state.translated_segments) / total_segments
+        progress_value = len(st.session_state.translated_segments) / total_segments if total_segments > 0 else 1
         progress_text = f"Translating... ({len(st.session_state.translated_segments)}/{total_segments})"
         progress_bar.progress(progress_value, text=progress_text)
 
@@ -277,9 +299,8 @@ def main():
 
         st.rerun()
 
-
     if st.session_state.review_mode and not st.session_state.translation_complete:
-        st.header("👀 5. Review and Refine Translations")
+        st.header("👀 7. Review and Refine Translations")
         if 'translated_segments' in st.session_state and st.session_state.translated_segments:
             if 'review_df' not in st.session_state:
                 review_data = {"Original": [seg['original_text'] for seg in st.session_state.translated_segments], "Translation": [seg['translated_text'] for seg in st.session_state.translated_segments]}
@@ -331,7 +352,7 @@ def main():
                         st.session_state.review_mode = False
                         st.session_state.translation_complete = True
                         # Clean up session state for the next run
-                        keys_to_delete = ['review_df', 'engine_choice', 'api_key', 'target_language', 'glossary', 'translator', 'total_segments', 'font_cache']
+                        keys_to_delete = ['review_df', 'translator', 'total_segments', 'font_cache']
                         for key in keys_to_delete:
                             if key in st.session_state:
                                 del st.session_state[key]
@@ -340,7 +361,7 @@ def main():
             st.warning("No translatable text was found in the document.")
 
     if st.session_state.translation_complete:
-        st.header("📥 6. Download Your Book")
+        st.header("📥 8. Download Your Book")
         st.info("Your translated book is ready. Click the button below to download it.")
         try:
             reconstructed_path = ""
@@ -375,7 +396,7 @@ def main():
                         mime_type = "application/epub+zip"
 
             with open(final_output_path, "rb") as file:
-                st.download_button(label="Download Translated Book", data=file, file_name=final_file_name, mime=mime_type, on_click=cleanup_temp_files)
+                st.download_button(label="Download Translated Book", data=file, file_name=final_file_name, mime=mime_type, on_click=cleanup_after_download)
             st.warning("After downloading, click 'Start Over' in the sidebar to translate another book.")
         except Exception as e:
             st.error(f"Failed to create the final file: {e}")

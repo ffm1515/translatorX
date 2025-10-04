@@ -1,6 +1,6 @@
 import google.generativeai as genai
 import streamlit as st
-from bs4 import BeautifulSoup, NavigableString
+from bs4 import BeautifulSoup
 import time
 import ebooklib
 from abc import ABC, abstractmethod
@@ -74,6 +74,7 @@ class GeminiTranslator(BaseTranslator):
         """
 
         try:
+            # Simple retry logic for rate limiting
             retries = 3
             for i in range(retries):
                 try:
@@ -81,7 +82,7 @@ class GeminiTranslator(BaseTranslator):
                     return response.text
                 except Exception as e:
                     if "rate limit" in str(e).lower() and i < retries - 1:
-                        time.sleep(2 ** i)
+                        time.sleep(2 ** i) # Exponential backoff
                     else:
                         raise e
         except Exception as e:
@@ -105,12 +106,9 @@ class DeepLTranslator(BaseTranslator):
         """Translates text using the DeepL API."""
         if not text or not text.strip():
             return ""
-
-        # DeepL's free API has a character limit, so we might need to split the text.
-        # For this PoC, we assume the text is within limits.
         try:
-            # DeepL uses target lang codes like 'DE', 'EN-US', 'EN-GB'. We'll try to be flexible.
-            # A simple mapping could be added here if needed.
+            # Note: DeepL glossary handling is a premium feature and would require more setup.
+            # This implementation passes the text directly.
             result = self.translator.translate_text(text, target_lang=target_language.upper())
             return result.text
         except deepl.DeepLException as e:
@@ -128,7 +126,7 @@ def process_epub_content(translator: BaseTranslator, book, target_language, glos
     """
     Processes EPUB content. Can operate in two modes:
     1. prepare_only=True: Extracts all translatable segments and returns them without translating.
-    2. prepare_only=False: Extracts and translates the content, returning the finished segments.
+    2. prepare_only=False: This mode is deprecated in the main app flow.
     """
     if css_selectors_to_ignore is None:
         css_selectors_to_ignore = []
@@ -137,40 +135,46 @@ def process_epub_content(translator: BaseTranslator, book, target_language, glos
     segments_to_translate = []
     soups = {}
     block_id_counter = 0
+    # Common block-level tags that usually contain translatable content.
     block_tags = ['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'li', 'blockquote', 'div']
 
     for item in items:
         soup = BeautifulSoup(item.get_content(), 'html.parser')
+
+        # Decompose elements matching ignore selectors before processing
         if css_selectors_to_ignore:
             for selector in css_selectors_to_ignore:
                 try:
                     for element in soup.select(selector):
                         element.decompose()
                 except Exception as e:
+                    # Log error for invalid selectors but don't stop the process
                     print(f"Warning: Invalid CSS selector '{selector}' skipped. Error: {e}")
 
-        for block_tag in block_tags:
-            for element in soup.find_all(block_tag):
-                if element.get_text(strip=True):
-                    unique_id = f"tx-block-{block_id_counter}"
-                    element['data-translatorx-id'] = unique_id
-                    block_id_counter += 1
-                    original_html = element.decode_contents()
-                    segments_to_translate.append({
-                        'original_text': original_html,
-                        'metadata': {'item_name': item.get_name(), 'block_id': unique_id}
-                    })
+        # Find all block-level elements that might contain text
+        for element in soup.find_all(block_tags):
+            # Only process elements that contain actual text
+            if element.get_text(strip=True):
+                unique_id = f"tx-block-{block_id_counter}"
+                element['data-translatorx-id'] = unique_id
+                block_id_counter += 1
+
+                # Extract the inner HTML of the block to preserve formatting
+                original_html = element.decode_contents()
+
+                segments_to_translate.append({
+                    'original_text': original_html,
+                    'metadata': {'item_name': item.get_name(), 'block_id': unique_id}
+                })
+
         soups[item.get_name()] = soup
 
     book_data = {'book': book, 'soups': soups, 'items': items}
 
-    # The main app flow now uses prepare_only=True and handles translation iteratively.
-    # The old direct translation logic is removed for clarity.
     if prepare_only:
         return segments_to_translate, book_data
     else:
-        # This else block is kept for potential future use-cases or testing,
-        # but is not used in the primary Streamlit workflow.
+        # This mode is no longer used by the main application but is kept for potential future use.
         raise NotImplementedError("Direct translation within process_epub_content is deprecated.")
 
 
@@ -178,12 +182,13 @@ def process_pdf_content(translator: BaseTranslator, pages_spans, target_language
     """
     Processes PDF content. Can operate in two modes:
     1. prepare_only=True: Extracts all translatable spans and returns them without translating.
-    2. prepare_only=False: Extracts and translates the content, returning the finished segments.
+    2. prepare_only=False: This mode is deprecated in the main app flow.
     """
     segments_to_translate = []
     for pno, page in enumerate(pages_spans):
         for span in page:
-            span['pno'] = pno  # Add page number to span metadata
+            # Add page number to each span's metadata for reconstruction
+            span['pno'] = pno
             segments_to_translate.append({
                 'original_text': span['text'],
                 'metadata': span
@@ -192,6 +197,5 @@ def process_pdf_content(translator: BaseTranslator, pages_spans, target_language
     if prepare_only:
         return segments_to_translate
     else:
-        # This else block is kept for potential future use-cases or testing,
-        # but is not used in the primary Streamlit workflow.
+        # This mode is no longer used by the main application.
         raise NotImplementedError("Direct translation within process_pdf_content is deprecated.")
