@@ -11,25 +11,33 @@ def parse_epub(file_path):
 
 def parse_pdf(file_path):
     """
-    Parses a PDF file and extracts all text spans with their metadata from each page.
-    Returns a list of pages, where each page is a list of span dictionaries.
+    Parses a PDF, extracting text spans and caching embedded font data.
+    Returns a dictionary containing the spans and the font cache.
     """
     doc = fitz.open(file_path)
     pages_spans = []
+    font_cache = {}  # Cache font data by xref
 
     for page in doc:
-        # Using get_text("dict") is the most detailed way to extract content.
-        page_dict = page.get_text("dict", flags=fitz.TEXTFLAGS_PRESERVE_WHITESPACE)
-
-        page_spans = []
+        page_dict = page.get_text("rawdict", flags=fitz.TEXTFLAGS_PRESERVE_WHITESPACE)
+        page_spans_list = []
         for block in page_dict.get("blocks", []):
-            if block["type"] == 0:  # 0 indicates a text block
+            if block["type"] == 0:  # Text block
                 for line in block.get("lines", []):
                     for span in line.get("spans", []):
-                        # We only care about spans with actual text content.
                         if span.get("text", "").strip():
-                            page_spans.append(span)
-        pages_spans.append(page_spans)
+                            font_xref = span.get("font_xref")
+                            if font_xref and font_xref not in font_cache:
+                                font_info = doc.extract_font(font_xref)
+                                if font_info and font_info[4]: # Ensure buffer is not empty
+                                    font_cache[font_xref] = {
+                                        "buffer": font_info[4],
+                                        "ext": font_info[1],
+                                        "name": font_info[0]
+                                    }
+                            span['font_xref'] = font_xref
+                            page_spans_list.append(span)
+        pages_spans.append(page_spans_list)
 
     doc.close()
-    return pages_spans
+    return {"spans": pages_spans, "font_cache": font_cache}

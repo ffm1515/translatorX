@@ -78,21 +78,6 @@ def reconstruct_epub(translated_segments, book_data, original_file_name, output_
     epub.write_epub(output_file_path, book, {})
     return output_file_path
 
-def _get_base_font_name(font_name):
-    """
-    A helper to get a valid base font name for PyMuPDF's built-in fonts.
-    This is a compromise for handling fonts without embedding them.
-    """
-    lower_font = font_name.lower()
-    if "courier" in lower_font:
-        return "cour"
-    if "times" in lower_font:
-        return "timo"
-    if "symbol" in lower_font:
-        return "symb"
-    # Default to Helvetica as it's a common sans-serif font
-    return "helv"
-
 from collections import defaultdict
 
 from reportlab.lib.pagesizes import landscape, letter
@@ -147,15 +132,22 @@ def _reconstruct_pdf_side_by_side(translated_segments, original_file_path):
     return final_path
 
 
-def reconstruct_pdf(translated_segments, original_file_path, output_format="Replace Original Text"):
+def reconstruct_pdf(translated_segments, original_file_path, font_cache, output_format="Replace Original Text"):
     """
-    Reconstructs a PDF based on the chosen output format.
+    Reconstructs a PDF based on the chosen output format, preserving original fonts.
     """
     if output_format == "Side-by-Side (Two Columns)":
         return _reconstruct_pdf_side_by_side(translated_segments, original_file_path)
 
     # Default behavior: Replace Original Text
     doc = fitz.open(original_file_path)
+
+    # --- Font Handling Setup ---
+    temp_font_dir = os.path.join("temp_output", "fonts")
+    os.makedirs(temp_font_dir, exist_ok=True)
+    font_paths = {}  # Cache for paths to temporary font files
+
+    # --- Segment Processing ---
     segments_by_page = defaultdict(list)
     for segment in translated_segments:
         pno = segment['metadata'].get('pno')
@@ -175,7 +167,24 @@ def reconstruct_pdf(translated_segments, original_file_path, output_format="Repl
             bbox = fitz.Rect(original_span['bbox'])
             page.draw_rect(bbox, color=(1, 1, 1), fill=(1, 1, 1), overlay=True)
 
-            fontname = _get_base_font_name(original_span['font'])
+            # --- Font Reconstruction ---
+            font_xref = original_span.get('font_xref')
+            font_info = font_cache.get(font_xref)
+            fontfile = None
+            fontname = "helv"  # Default fallback font
+
+            if font_info and font_info.get("buffer"):
+                if font_xref not in font_paths:
+                    font_ext = font_info.get("ext", "ttf")
+                    temp_font_path = os.path.join(temp_font_dir, f"font_{font_xref}.{font_ext}")
+                    with open(temp_font_path, "wb") as f_out:
+                        f_out.write(font_info["buffer"])
+                    font_paths[font_xref] = temp_font_path
+
+                fontfile = font_paths[font_xref]
+                fontname = font_info.get("name", f"F{font_xref}")
+
+            # --- Text Insertion ---
             fontsize = original_span['size']
             fontcolor_int = original_span['color']
             r = ((fontcolor_int >> 16) & 0xFF) / 255.0
@@ -186,13 +195,13 @@ def reconstruct_pdf(translated_segments, original_file_path, output_format="Repl
             min_fontsize = 4.0
             current_fontsize = fontsize
             leftover_text = page.insert_textbox(
-                bbox, translated_text, fontsize=current_fontsize, fontname=fontname, color=color_tuple, align=0
+                bbox, translated_text, fontsize=current_fontsize, fontname=fontname, fontfile=fontfile, color=color_tuple, align=0
             )
             while leftover_text > 1 and current_fontsize > min_fontsize:
                 current_fontsize -= 0.5
                 page.draw_rect(bbox, color=(1, 1, 1), fill=(1, 1, 1), overlay=True)
                 leftover_text = page.insert_textbox(
-                    bbox, translated_text, fontsize=current_fontsize, fontname=fontname, color=color_tuple, align=0
+                    bbox, translated_text, fontsize=current_fontsize, fontname=fontname, fontfile=fontfile, color=color_tuple, align=0
                 )
 
     output_dir = "temp_output"
