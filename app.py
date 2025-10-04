@@ -43,6 +43,21 @@ def cleanup_temp_files():
     if os.path.exists("temp_output"):
         shutil.rmtree("temp_output")
 
+def cleanup_after_download():
+    """Cleans up temporary files and session state keys after a successful download."""
+    cleanup_temp_files()
+    keys_to_clear = [
+        'review_df', 'engine_choice', 'api_key', 'target_language',
+        'glossary', 'translated_segments', 'book_data', 'original_extension',
+        'temp_file_path', 'uploaded_file_name', 'uploaded_file_buffer',
+        'translation_complete', 'review_mode'
+    ]
+    for key in keys_to_clear:
+        if key in st.session_state:
+            del st.session_state[key]
+
+import subprocess
+
 # --- Main Application UI ---
 def main():
     """Main function to run the Streamlit application."""
@@ -50,6 +65,14 @@ def main():
 
     st.title("📚 translatorX")
     st.markdown("Translate EPUB and PDF files while preserving the original layout and formatting.")
+
+    # Check for Calibre's ebook-convert tool
+    if not shutil.which("ebook-convert"):
+        st.warning("""
+            **Calibre is not installed or not in your system's PATH.**
+            To translate formats other than EPUB and PDF (e.g., .mobi, .azw3),
+            please [install Calibre](https://calibre-ebook.com/download) and ensure `ebook-convert` is accessible.
+            """, icon="⚠️")
 
     with st.sidebar:
         st.header("⚙️ 1. Configure Settings")
@@ -79,6 +102,15 @@ def main():
         st.header("📖 3. Add a Glossary (Optional)")
         glossary_file = st.file_uploader("Upload Glossary (CSV)", type=["csv"], help="Upload a two-column CSV.")
 
+        st.header("🛡️ 4. Content Filtering (EPUB Only)")
+        ignore_selectors_str = st.text_area(
+            "Ignore content via CSS selectors",
+            placeholder="e.g., .no-translate\npre\n.chapter-title",
+            help="Enter one CSS selector per line. Any text within elements matching these selectors will not be translated. This is only applied to EPUB files."
+        )
+        st.session_state.ignore_selectors = [s.strip() for s in ignore_selectors_str.split('\n') if s.strip()]
+
+
         st.header("🔄 Reset")
         if st.button("Start Over"):
             cleanup_temp_files()
@@ -86,7 +118,8 @@ def main():
             st.rerun()
 
     st.header("📤 3. Upload Your Book")
-    uploaded_file = st.file_uploader("Upload an EPUB or PDF file", type=["epub", "pdf"], disabled=st.session_state.processing)
+    accepted_formats = ["epub", "pdf", "mobi", "azw3"]
+    uploaded_file = st.file_uploader("Upload a book file", type=accepted_formats, disabled=st.session_state.processing)
 
     if uploaded_file is not None:
         st.session_state.uploaded_file_name = uploaded_file.name
@@ -108,6 +141,21 @@ def main():
 
         st.session_state.temp_file_path = file_path
 
+        original_extension = os.path.splitext(st.session_state.uploaded_file_name)[1].lower()
+        st.session_state.original_extension = original_extension
+
+        # --- Pre-translation Conversion (if needed) ---
+        if original_extension not in [".epub", ".pdf"]:
+            with st.spinner(f"Converting {original_extension} to EPUB..."):
+                epub_path = os.path.join(st.session_state.temp_dir, "converted.epub")
+                try:
+                    subprocess.run(["ebook-convert", file_path, epub_path], check=True)
+                    file_path = epub_path # Use the converted file for translation
+                    st.info("Conversion to EPUB successful.")
+                except (subprocess.CalledProcessError, FileNotFoundError) as e:
+                    st.error(f"Failed to convert file to EPUB. Ensure Calibre is installed and accessible. Error: {e}")
+                    st.stop()
+
         try:
             st.session_state.engine_choice = engine_choice
             st.session_state.api_key = api_key
@@ -117,17 +165,23 @@ def main():
             translator = get_translator(st.session_state.engine_choice, st.session_state.api_key)
 
             with st.spinner(f"Translating with {st.session_state.engine_choice}..."):
-                file_extension = os.path.splitext(file_path)[1].lower()
-                if file_extension == ".epub":
-                    st.session_state.file_type = "epub"
-                    book = parse_epub(file_path)
-                    processed_data = process_epub_content(translator, book, target_language, glossary)
-                    st.session_state.translated_segments = processed_data.get('segments', [])
-                    st.session_state.book_data = {'book': processed_data.get('book'), 'soups': processed_data.get('soups'), 'items': processed_data.get('items')}
-                elif file_extension == ".pdf":
+                # The file for translation is now always epub or pdf
+                if original_extension == ".pdf":
                     st.session_state.file_type = "pdf"
                     pages_spans = parse_pdf(file_path)
                     st.session_state.translated_segments = process_pdf_content(translator, pages_spans, target_language, glossary)
+                else: # All other formats are converted to EPUB
+                    st.session_state.file_type = "epub"
+                    book = parse_epub(file_path)
+                    processed_data = process_epub_content(
+                        translator=translator,
+                        book=book,
+                        target_language=target_language,
+                        glossary=glossary,
+                        ignore_selectors=st.session_state.get('ignore_selectors', [])
+                    )
+                    st.session_state.translated_segments = processed_data.get('segments', [])
+                    st.session_state.book_data = {'book': processed_data.get('book'), 'soups': processed_data.get('soups'), 'items': processed_data.get('items')}
 
             st.success("Translation complete! Please review the segments below.")
             st.session_state.review_mode = True
@@ -184,11 +238,14 @@ def main():
                     for i, row in st.session_state.review_df.iterrows():
                         if i < len(st.session_state.translated_segments):
                             st.session_state.translated_segments[i]['translated_text'] = row['Translation']
+
+                    # Set flags to exit review mode and show download section
                     st.session_state.review_mode = False
                     st.session_state.translation_complete = True
-                    for key in ['review_df', 'engine_choice', 'api_key', 'target_language', 'glossary']:
-                        if key in st.session_state:
-                            del st.session_state[key]
+
+                    # Clean up only the dataframe used for editing
+                    if 'review_df' in st.session_state:
+                        del st.session_state.review_df
                     st.rerun()
         else:
             st.warning("No translatable text was found in the document.")
@@ -199,12 +256,41 @@ def main():
         output_file_path = ""
         try:
             with st.spinner("Finalizing your file..."):
+                final_file_path = ""
                 if st.session_state.file_type == "epub":
-                    output_file_path = reconstruct_epub(translated_segments=st.session_state.translated_segments, book_data=st.session_state.book_data, original_file_name=st.session_state.uploaded_file_name, output_format=st.session_state.output_format)
+                    # Reconstruct the book as an EPUB first
+                    reconstructed_epub_path = reconstruct_epub(translated_segments=st.session_state.translated_segments, book_data=st.session_state.book_data, original_file_name=st.session_state.uploaded_file_name, output_format=st.session_state.output_format)
+
+                    # Convert back to original format if necessary
+                    if st.session_state.original_extension != ".epub":
+                        with st.spinner(f"Converting back to {st.session_state.original_extension}..."):
+                            base_name = os.path.splitext(st.session_state.uploaded_file_name)[0]
+                            final_name = f"translated_{base_name}{st.session_state.original_extension}"
+                            final_file_path = os.path.join("temp_output", final_name)
+                            try:
+                                subprocess.run(["ebook-convert", reconstructed_epub_path, final_file_path], check=True)
+                            except (subprocess.CalledProcessError, FileNotFoundError) as e:
+                                st.error(f"Failed to convert back to {st.session_state.original_extension}. Error: {e}")
+                                st.stop()
+                    else:
+                        final_file_path = reconstructed_epub_path
+
                 elif st.session_state.file_type == "pdf":
-                    output_file_path = reconstruct_pdf(translated_segments=st.session_state.translated_segments, original_file_path=st.session_state.temp_file_path, output_format=st.session_state.output_format)
-            with open(output_file_path, "rb") as file:
-                st.download_button(label="Download Translated Book", data=file, file_name=os.path.basename(output_file_path), mime=f"application/{'epub+zip' if st.session_state.file_type == 'epub' else 'pdf'}", on_click=cleanup_temp_files)
+                    # PDF files are not converted, so the path is direct
+                    final_file_path = reconstruct_pdf(translated_segments=st.session_state.translated_segments, original_file_path=st.session_state.temp_file_path, output_format=st.session_state.output_format)
+
+            # --- Download Button Logic ---
+            if final_file_path and os.path.exists(final_file_path):
+                with open(final_file_path, "rb") as file:
+                    st.download_button(
+                        label="Download Translated Book",
+                        data=file,
+                        file_name=os.path.basename(final_file_path),
+                        on_click=cleanup_after_download
+                    )
+            else:
+                st.error("Could not generate the final file for download.")
+
             st.warning("After downloading, click 'Start Over' in the sidebar to translate another book.")
         except Exception as e:
             st.error(f"Failed to create the final file: {e}")

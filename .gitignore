@@ -1,0 +1,17 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Temporary files
+temp_*
+streamlit.log
+jules-scratch/
+
+# Distribution / build artifacts
+.env
+.venv
+dist/
+build/
+*.egg-info/

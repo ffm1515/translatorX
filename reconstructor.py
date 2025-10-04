@@ -27,10 +27,13 @@ def reconstruct_epub(translated_segments, book_data, original_file_name, output_
             new_p = soup.new_tag("p")
             new_p.string = translated_text
             new_p.attrs['style'] = "font-style: italic; color: #555; margin-top: 5px; margin-bottom: 5px;"
-            if node.parent and node.parent.name != 'body':
-                 node.parent.insert_after(new_p)
-            else: # Fallback for nodes directly under body
-                 node.insert_after(new_p)
+            if node.parent:
+                # If the parent is the body, append the new paragraph.
+                # Otherwise, insert it after the parent element (e.g., after the <p> tag).
+                if node.parent.name == 'body':
+                    node.parent.append(new_p)
+                else:
+                    node.parent.insert_after(new_p)
 
         elif output_format == "Side-by-Side (Two Columns)":
             # Replace the text node with a 2-column table
@@ -117,8 +120,11 @@ def _reconstruct_pdf_side_by_side(translated_segments, original_file_path):
         story.append(Paragraph(f"--- Original Page: {pno + 1} ---", styleH))
         story.append(Spacer(1, 0.2 * inch))
 
+        # Sort segments by vertical position to maintain reading order
+        page_segments = sorted(segments_by_page[pno], key=lambda s: s['metadata']['bbox'][1])
+
         table_data = []
-        for segment in segments_by_page[pno]:
+        for segment in page_segments:
             original_text = segment['original_text'].replace('\n', '<br/>')
             translated_text = segment['translated_text'].replace('\n', '<br/>')
             table_data.append([Paragraph(original_text, styleN), Paragraph(translated_text, styleN)])

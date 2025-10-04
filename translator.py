@@ -120,31 +120,47 @@ class DeepLTranslator(BaseTranslator):
 
 # --- Content Processing Functions ---
 
-def process_epub_content(translator: BaseTranslator, book, target_language, glossary=None):
+def process_epub_content(translator: BaseTranslator, book, target_language, glossary=None, ignore_selectors=None):
     """
-    Processes and translates EPUB content.
+    Processes and translates EPUB content, optionally ignoring text based on CSS selectors.
     Returns a list of translation segments for review.
-    Each segment is a dict: {'original_text': str, 'translated_text': str, 'metadata': {'item': obj, 'node': obj, 'soup': obj}}
     """
+    if ignore_selectors is None:
+        ignore_selectors = []
+
     items = list(book.get_items_of_type(ebooklib.ITEM_DOCUMENT))
     segments = []
 
-    # First, collect all text nodes and their context
     all_text_nodes_with_context = []
     all_original_texts = []
-    soups = {} # Store soups to avoid re-parsing
+    soups = {}
 
     for item in items:
         soup = BeautifulSoup(item.get_content(), 'html.parser')
         soups[item.get_name()] = soup
         text_nodes_in_item = soup.find_all(string=True)
+
         for node in text_nodes_in_item:
             if isinstance(node, NavigableString) and node.parent.name not in ['style', 'script']:
                 original_text = str(node).strip()
-                if original_text:
-                    # Store the node, its parent item, and the soup object for later reconstruction
-                    all_text_nodes_with_context.append({'node': node, 'item': item, 'soup': soup})
-                    all_original_texts.append(original_text)
+                if not original_text:
+                    continue
+
+                # --- Filtering Logic ---
+                should_ignore = False
+                if ignore_selectors:
+                    for selector in ignore_selectors:
+                        # Check if the node's parent matches any of the selectors
+                        if node.parent.select_one(selector):
+                            should_ignore = True
+                            break # Found a match, no need to check other selectors
+
+                if should_ignore:
+                    continue # Skip this node
+                # --- End Filtering Logic ---
+
+                all_text_nodes_with_context.append({'node': node, 'item': item, 'soup': soup})
+                all_original_texts.append(original_text)
 
     delimiter = "[END_OF_TEXT_NODE]"
     full_text_to_translate = delimiter.join(all_original_texts)
