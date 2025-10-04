@@ -85,8 +85,10 @@ class GeminiTranslator(BaseTranslator):
                     else:
                         raise e
         except Exception as e:
-            st.error(f"An error occurred during Gemini translation: {e}")
-            return text
+            # Instead of just logging, return a clear error message for the specific block.
+            error_message = f"🔴 FEHLER: Gemini-API-Fehler - {type(e).__name__}"
+            print(f"Error during Gemini translation: {e}") # Log the full error to console
+            return error_message
 
 class DeepLTranslator(BaseTranslator):
     """Translator implementation for the DeepL API."""
@@ -112,36 +114,33 @@ class DeepLTranslator(BaseTranslator):
             result = self.translator.translate_text(text, target_lang=target_language.upper())
             return result.text
         except deepl.DeepLException as e:
-            st.error(f"An error occurred during DeepL translation: {e}")
-            return text
+            error_message = f"🔴 FEHLER: DeepL-API-Fehler - {type(e).__name__}"
+            print(f"Error during DeepL translation: {e}")
+            return error_message
         except Exception as e:
-            st.error(f"An unexpected error occurred during DeepL translation: {e}")
-            return text
+            error_message = f"🔴 FEHLER: Unerwarteter Fehler - {type(e).__name__}"
+            print(f"An unexpected error occurred during DeepL translation: {e}")
+            return error_message
 
 # --- Content Processing Functions ---
 
-def process_epub_content(translator: BaseTranslator, book, target_language, glossary=None, css_selectors_to_ignore=None):
+def process_epub_content(translator: BaseTranslator, book, target_language, glossary=None, css_selectors_to_ignore=None, prepare_only=False):
     """
-    Processes and translates EPUB content by treating block-level elements as translation units.
-    This preserves inline formatting and improves translation context.
+    Processes EPUB content. Can operate in two modes:
+    1. prepare_only=True: Extracts all translatable segments and returns them without translating.
+    2. prepare_only=False: Extracts and translates the content, returning the finished segments.
     """
     if css_selectors_to_ignore is None:
         css_selectors_to_ignore = []
 
     items = list(book.get_items_of_type(ebooklib.ITEM_DOCUMENT))
-    segments = []
-    all_original_html_blocks = []
-    all_block_contexts = []
+    segments_to_translate = []
     soups = {}
     block_id_counter = 0
-
-    # Define common block-level tags that should be translated as a whole unit.
     block_tags = ['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'li', 'blockquote', 'div']
 
     for item in items:
         soup = BeautifulSoup(item.get_content(), 'html.parser')
-
-        # 1. Decompose ignored elements first
         if css_selectors_to_ignore:
             for selector in css_selectors_to_ignore:
                 try:
@@ -150,131 +149,49 @@ def process_epub_content(translator: BaseTranslator, book, target_language, glos
                 except Exception as e:
                     print(f"Warning: Invalid CSS selector '{selector}' skipped. Error: {e}")
 
-        # 2. Find, tag, and extract content from block-level elements
         for block_tag in block_tags:
             for element in soup.find_all(block_tag):
-                # Only process elements that contain some text
                 if element.get_text(strip=True):
-                    # Assign a unique ID for reconstruction
                     unique_id = f"tx-block-{block_id_counter}"
                     element['data-translatorx-id'] = unique_id
                     block_id_counter += 1
-
-                    # Extract the inner HTML of the block
                     original_html = element.decode_contents()
-                    all_original_html_blocks.append(original_html)
-
-                    # Store context needed for reconstruction
-                    all_block_contexts.append({
-                        'item_name': item.get_name(),
-                        'block_id': unique_id
+                    segments_to_translate.append({
+                        'original_text': original_html,
+                        'metadata': {'item_name': item.get_name(), 'block_id': unique_id}
                     })
-
         soups[item.get_name()] = soup
 
-    delimiter = "[END_OF_TEXT_NODE]"
-    full_text_to_translate = delimiter.join(all_original_html_blocks)
+    book_data = {'book': book, 'soups': soups, 'items': items}
 
-    if not full_text_to_translate:
-        return {'segments': [], 'book_data': None}
-
-    # Attempt full-context translation of all HTML blocks
-    full_translated_text = translator.translate(full_text_to_translate, target_language, glossary)
-    all_translated_blocks = full_translated_text.split(delimiter)
-
-    # Check for translation success
-    if len(all_original_html_blocks) == len(all_translated_blocks):
-        print("INFO: Global EPUB translation (block-level) successful.")
-        for i, original_html in enumerate(all_original_html_blocks):
-            segments.append({
-                'original_text': original_html,
-                'translated_text': all_translated_blocks[i].strip(),
-                'metadata': all_block_contexts[i]
-            })
+    # The main app flow now uses prepare_only=True and handles translation iteratively.
+    # The old direct translation logic is removed for clarity.
+    if prepare_only:
+        return segments_to_translate, book_data
     else:
-        # Fallback to block-by-block translation
-        print("WARNING: Global EPUB translation failed. Falling back to block-by-block mode.")
-        segments = []
-        for i, original_html in enumerate(all_original_html_blocks):
-            translated_html = translator.translate(original_html, target_language, glossary)
-            segments.append({
-                'original_text': original_html,
-                'translated_text': translated_html.strip(),
-                'metadata': all_block_contexts[i]
-            })
-
-    # The 'soups' now contain the uniquely tagged elements, ready for reconstruction
-    return {'segments': segments, 'book': book, 'soups': soups, 'items': items}
+        # This else block is kept for potential future use-cases or testing,
+        # but is not used in the primary Streamlit workflow.
+        raise NotImplementedError("Direct translation within process_epub_content is deprecated.")
 
 
-def process_pdf_content(translator: BaseTranslator, pages_spans, target_language, glossary=None):
+def process_pdf_content(translator: BaseTranslator, pages_spans, target_language, glossary=None, prepare_only=False):
     """
-    Processes and translates text from a PDF.
-    Returns a flat list of translation segments for review.
-    Each segment is a dict: {'original_text': str, 'translated_text': str, 'metadata': span_dict_with_pno}
+    Processes PDF content. Can operate in two modes:
+    1. prepare_only=True: Extracts all translatable spans and returns them without translating.
+    2. prepare_only=False: Extracts and translates the content, returning the finished segments.
     """
-    all_spans_with_pno = []
+    segments_to_translate = []
     for pno, page in enumerate(pages_spans):
         for span in page:
             span['pno'] = pno  # Add page number to span metadata
-            all_spans_with_pno.append(span)
-
-    if not all_spans_with_pno:
-        return []
-
-    all_original_texts = [span['text'] for span in all_spans_with_pno]
-    delimiter = "[END_OF_SPAN]"
-    full_text_to_translate = delimiter.join(all_original_texts)
-    segments = []
-
-    if not full_text_to_translate.strip():
-        return []
-
-    # Attempt full-context translation
-    full_translated_text = translator.translate(full_text_to_translate, target_language, glossary)
-    all_translated_texts = full_translated_text.split(delimiter)
-
-    # If global translation is successful
-    if len(all_original_texts) == len(all_translated_texts):
-        print("INFO: Global PDF translation successful.")
-        for i, span in enumerate(all_spans_with_pno):
-            segments.append({
+            segments_to_translate.append({
                 'original_text': span['text'],
-                'translated_text': all_translated_texts[i].strip(),
                 'metadata': span
             })
-        return segments
+
+    if prepare_only:
+        return segments_to_translate
     else:
-        # Fallback to page-by-page translation
-        print("WARNING: Global PDF translation failed. Falling back to page-by-page mode.")
-        segments = []  # Reset segments list
-        for i, page_spans_item in enumerate(pages_spans):
-            page_original_texts = [span['text'] for span in page_spans_item]
-            if not any(s.strip() for s in page_original_texts):
-                continue
-
-            page_full_text = delimiter.join(page_original_texts)
-            page_translated_full_text = translator.translate(page_full_text, target_language, glossary)
-            page_translated_texts = page_translated_full_text.split(delimiter)
-
-            if len(page_original_texts) == len(page_translated_texts):
-                print(f"INFO: Page-by-page PDF translation successful for page {i + 1}.")
-                for j, span in enumerate(page_spans_item):
-                    span['pno'] = i  # Ensure pno is correct
-                    segments.append({
-                        'original_text': span['text'],
-                        'translated_text': page_translated_texts[j].strip(),
-                        'metadata': span
-                    })
-            else:
-                # Further fallback to span-by-span for this page
-                print(f"WARNING: Page-by-page PDF translation for page {i + 1} failed. Falling back to span-by-span mode.")
-                for span in page_spans_item:
-                    span['pno'] = i  # Ensure pno is correct
-                    translated_text = translator.translate(span['text'], target_language, glossary)
-                    segments.append({
-                        'original_text': span['text'],
-                        'translated_text': translated_text.strip(),
-                        'metadata': span
-                    })
-        return segments
+        # This else block is kept for potential future use-cases or testing,
+        # but is not used in the primary Streamlit workflow.
+        raise NotImplementedError("Direct translation within process_pdf_content is deprecated.")
