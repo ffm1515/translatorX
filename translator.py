@@ -122,119 +122,133 @@ class DeepLTranslator(BaseTranslator):
 
 def process_epub_content(translator: BaseTranslator, book, target_language, glossary=None):
     """
-    Processes and translates the content of an EPUB book object using a global context strategy
-    with a chapter-by-chapter fallback.
+    Processes and translates EPUB content.
+    Returns a list of translation segments for review.
+    Each segment is a dict: {'original_text': str, 'translated_text': str, 'metadata': {'item': obj, 'node': obj, 'soup': obj}}
     """
     items = list(book.get_items_of_type(ebooklib.ITEM_DOCUMENT))
-    soups = [BeautifulSoup(item.get_content(), 'html.parser') for item in items]
+    segments = []
 
-    all_text_nodes_for_global = []
-    all_original_texts_for_global = []
+    # First, collect all text nodes and their context
+    all_text_nodes_with_context = []
+    all_original_texts = []
+    soups = {} # Store soups to avoid re-parsing
 
-    for soup in soups:
-        text_nodes = soup.find_all(string=True)
-        for node in text_nodes:
+    for item in items:
+        soup = BeautifulSoup(item.get_content(), 'html.parser')
+        soups[item.get_name()] = soup
+        text_nodes_in_item = soup.find_all(string=True)
+        for node in text_nodes_in_item:
             if isinstance(node, NavigableString) and node.parent.name not in ['style', 'script']:
-                original_text = str(node)
-                if original_text.strip():
-                    all_text_nodes_for_global.append(node)
-                    all_original_texts_for_global.append(original_text)
+                original_text = str(node).strip()
+                if original_text:
+                    # Store the node, its parent item, and the soup object for later reconstruction
+                    all_text_nodes_with_context.append({'node': node, 'item': item, 'soup': soup})
+                    all_original_texts.append(original_text)
 
     delimiter = "[END_OF_TEXT_NODE]"
-    full_text_to_translate = delimiter.join(all_original_texts_for_global)
+    full_text_to_translate = delimiter.join(all_original_texts)
 
-    if full_text_to_translate:
-        full_translated_text = translator.translate(full_text_to_translate, target_language, glossary)
-        all_translated_texts = full_translated_text.split(delimiter)
+    if not full_text_to_translate:
+        return {'segments': [], 'book_data': None}
 
-        if len(all_original_texts_for_global) == len(all_translated_texts):
-            print("INFO: Globale Rekonstruktion erfolgreich.")
-            for i, node in enumerate(all_text_nodes_for_global):
-                node.replace_with(all_translated_texts[i])
+    # Attempt full-context translation
+    full_translated_text = translator.translate(full_text_to_translate, target_language, glossary)
+    all_translated_texts = full_translated_text.split(delimiter)
 
-            for i, item in enumerate(items):
-                item.set_content(soups[i].prettify(encoding='utf-8'))
-
-            return book
-        else:
-            print("WARNUNG: Globale Rekonstruktion fehlgeschlagen. Wechsle zu robusterem Modus.")
-            for item in book.get_items_of_type(ebooklib.ITEM_DOCUMENT):
-                soup = BeautifulSoup(item.get_content(), 'html.parser')
-                text_nodes_in_item = soup.find_all(string=True)
-
-                for node in text_nodes_in_item:
-                    if isinstance(node, NavigableString) and node.parent.name not in ['style', 'script']:
-                        original_text = str(node)
-                        if original_text.strip():
-                            translated_text = translator.translate(original_text, target_language, glossary)
-                            node.replace_with(translated_text)
-
-                item.set_content(soup.prettify(encoding='utf-8'))
-
-            return book
+    # If global translation is successful, create segments
+    if len(all_original_texts) == len(all_translated_texts):
+        print("INFO: Global EPUB translation successful.")
+        for i, original_text in enumerate(all_original_texts):
+            segments.append({
+                'original_text': original_text,
+                'translated_text': all_translated_texts[i].strip(),
+                'metadata': all_text_nodes_with_context[i]
+            })
     else:
-        return book
+        # Fallback: translate text node by text node (less context, more robust)
+        print("WARNING: Global EPUB translation failed. Falling back to segment-by-segment mode.")
+        segments = []
+        for i, original_text in enumerate(all_original_texts):
+            translated_text = translator.translate(original_text, target_language, glossary)
+            segments.append({
+                'original_text': original_text,
+                'translated_text': translated_text.strip(),
+                'metadata': all_text_nodes_with_context[i]
+            })
+
+    # Return segments for review and book data for reconstruction
+    return {'segments': segments, 'book': book, 'soups': soups, 'items': items}
+
 
 def process_pdf_content(translator: BaseTranslator, pages_spans, target_language, glossary=None):
     """
-    Processes and translates text from a PDF using a global context strategy
-    with a multi-layered page-by-page and span-by-span fallback.
+    Processes and translates text from a PDF.
+    Returns a flat list of translation segments for review.
+    Each segment is a dict: {'original_text': str, 'translated_text': str, 'metadata': span_dict_with_pno}
     """
-    all_spans = [span for page in pages_spans for span in page]
-    all_original_texts = [span['text'] for span in all_spans]
+    all_spans_with_pno = []
+    for pno, page in enumerate(pages_spans):
+        for span in page:
+            span['pno'] = pno  # Add page number to span metadata
+            all_spans_with_pno.append(span)
 
+    if not all_spans_with_pno:
+        return []
+
+    all_original_texts = [span['text'] for span in all_spans_with_pno]
     delimiter = "[END_OF_SPAN]"
     full_text_to_translate = delimiter.join(all_original_texts)
+    segments = []
 
-    if full_text_to_translate:
-        full_translated_text = translator.translate(full_text_to_translate, target_language, glossary)
-        all_translated_texts = full_translated_text.split(delimiter)
-
-        if len(all_original_texts) == len(all_translated_texts):
-            print("INFO: Globale PDF-Rekonstruktion erfolgreich.")
-
-            translated_spans_iterator = iter(all_translated_texts)
-            translated_pages = []
-            for page_spans in pages_spans:
-                page_translations = []
-                for span in page_spans:
-                    page_translations.append({
-                        'original_span': span,
-                        'translated_text': next(translated_spans_iterator)
-                    })
-                translated_pages.append(page_translations)
-            return translated_pages
-        else:
-            print("WARNUNG: Globale PDF-Rekonstruktion fehlgeschlagen. Wechsle zu robusterem Modus.")
-            translated_pages = []
-            for i, page_spans in enumerate(pages_spans):
-                page_translations = []
-                page_original_texts = [span['text'] for span in page_spans]
-                page_full_text = delimiter.join(page_original_texts)
-
-                if not page_full_text:
-                    translated_pages.append([])
-                    continue
-
-                page_translated_full_text = translator.translate(page_full_text, target_language, glossary)
-                page_translated_texts = page_translated_full_text.split(delimiter)
-
-                if len(page_original_texts) == len(page_translated_texts):
-                    print(f"INFO: Seitenweise PDF-Rekonstruktion erfolgreich für Seite {i + 1}.")
-                    for j, span in enumerate(page_spans):
-                        page_translations.append({
-                            'original_span': span,
-                            'translated_text': page_translated_texts[j]
-                        })
-                else:
-                    print(f"WARNUNG: Seitenweise PDF-Rekonstruktion für Seite {i + 1} fehlgeschlagen. Wechsle zu Span-für-Span-Modus.")
-                    for span in page_spans:
-                        translated_text = translator.translate(span['text'], target_language, glossary)
-                        page_translations.append({
-                            'original_span': span,
-                            'translated_text': translated_text
-                        })
-                translated_pages.append(page_translations)
-            return translated_pages
-    else:
+    if not full_text_to_translate.strip():
         return []
+
+    # Attempt full-context translation
+    full_translated_text = translator.translate(full_text_to_translate, target_language, glossary)
+    all_translated_texts = full_translated_text.split(delimiter)
+
+    # If global translation is successful
+    if len(all_original_texts) == len(all_translated_texts):
+        print("INFO: Global PDF translation successful.")
+        for i, span in enumerate(all_spans_with_pno):
+            segments.append({
+                'original_text': span['text'],
+                'translated_text': all_translated_texts[i].strip(),
+                'metadata': span
+            })
+        return segments
+    else:
+        # Fallback to page-by-page translation
+        print("WARNING: Global PDF translation failed. Falling back to page-by-page mode.")
+        segments = []  # Reset segments list
+        for i, page_spans_item in enumerate(pages_spans):
+            page_original_texts = [span['text'] for span in page_spans_item]
+            if not any(s.strip() for s in page_original_texts):
+                continue
+
+            page_full_text = delimiter.join(page_original_texts)
+            page_translated_full_text = translator.translate(page_full_text, target_language, glossary)
+            page_translated_texts = page_translated_full_text.split(delimiter)
+
+            if len(page_original_texts) == len(page_translated_texts):
+                print(f"INFO: Page-by-page PDF translation successful for page {i + 1}.")
+                for j, span in enumerate(page_spans_item):
+                    span['pno'] = i  # Ensure pno is correct
+                    segments.append({
+                        'original_text': span['text'],
+                        'translated_text': page_translated_texts[j].strip(),
+                        'metadata': span
+                    })
+            else:
+                # Further fallback to span-by-span for this page
+                print(f"WARNING: Page-by-page PDF translation for page {i + 1} failed. Falling back to span-by-span mode.")
+                for span in page_spans_item:
+                    span['pno'] = i  # Ensure pno is correct
+                    translated_text = translator.translate(span['text'], target_language, glossary)
+                    segments.append({
+                        'original_text': span['text'],
+                        'translated_text': translated_text.strip(),
+                        'metadata': span
+                    })
+        return segments
